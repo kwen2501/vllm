@@ -37,7 +37,7 @@ ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default"]
-DCPCommBackend = Literal["ag_rs", "a2a"]
+DCPCommBackend = Literal["ag_rs", "a2a", "a2a_symm"]
 EPLBCommunicatorBackend = Literal["torch_nccl", "torch_gloo", "nixl", "pynccl"]
 All2AllBackend = Literal[
     "naive",
@@ -357,6 +357,10 @@ class ParallelConfig:
     - "a2a": All-to-All exchange of partial outputs + LSE, then
       combine with Triton kernel. Reduces NCCL calls from 3 to 2
       per layer for MLA models.
+    - "a2a_symm": Same exchange, but written peer-to-peer into symmetric
+      memory instead of going through NCCL, which removes the staging
+      buffer and the collective launch. Requires an intra-node DCP group
+      with symmetric memory support; falls back to "a2a" otherwise.
     """
 
     cp_kv_cache_interleave_size: int = 1
@@ -538,9 +542,13 @@ class ParallelConfig:
                 f"{sorted({1, pcp, tp * pcp})}."
             )
 
-        if self.dcp_comm_backend == "a2a" and self.decode_context_parallel_size <= 1:
+        if (
+            self.dcp_comm_backend in ("a2a", "a2a_symm")
+            and self.decode_context_parallel_size <= 1
+        ):
             raise ValueError(
-                "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
+                f"dcp_comm_backend='{self.dcp_comm_backend}' requires "
+                "decode_context_parallel_size > 1."
             )
 
         return self

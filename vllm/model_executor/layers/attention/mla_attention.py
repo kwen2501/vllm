@@ -276,7 +276,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_combine_fn
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.triton_merge_attn_states import mask_empty_context
 from vllm.v1.attention.selector import get_attn_backend
@@ -555,9 +555,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         _vllm_config = get_current_vllm_config_or_none()
         self.dcp_a2a = (
-            _vllm_config is not None
+            dcp_a2a_combine_fn(_vllm_config.parallel_config.dcp_comm_backend)
+            if _vllm_config is not None
             and _vllm_config.parallel_config.decode_context_parallel_size > 1
-            and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
+            else None
         )
 
         # Initialize q/k/v range constants.
@@ -921,8 +922,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 assert lse is not None
-                if self.dcp_a2a:
-                    attn_out = dcp_a2a_lse_reduce(
+                if self.dcp_a2a is not None:
+                    attn_out = self.dcp_a2a(
                         attn_out,
                         lse,
                         get_dcp_group(),

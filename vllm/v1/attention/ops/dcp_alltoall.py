@@ -20,6 +20,7 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +31,17 @@ from vllm.triton_utils import tl, triton
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.attention.ops.common import CPTritonContext
+
+
+def dcp_a2a_combine_fn(dcp_comm_backend: str) -> Callable | None:
+    """Return the A2A combine for this backend, or None if it is not one."""
+    if dcp_comm_backend == "a2a":
+        return dcp_a2a_lse_reduce
+    if dcp_comm_backend == "a2a_symm":
+        from vllm.v1.attention.ops.dcp_symm_a2a import dcp_symm_a2a_lse_reduce
+
+        return dcp_symm_a2a_lse_reduce
+    return None
 
 
 def _lse_weighted_combine(

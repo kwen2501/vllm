@@ -24,9 +24,17 @@ mp.set_start_method("spawn", force=True)
 
 
 class _FakeCPGroup:
-    def __init__(self, world_size: int, device_group: dist.ProcessGroup):
+    def __init__(
+        self,
+        world_size: int,
+        device_group: dist.ProcessGroup,
+        rank_in_group: int = 0,
+        cpu_group: dist.ProcessGroup | None = None,
+    ):
         self.world_size = world_size
         self.device_group = device_group
+        self.rank_in_group = rank_in_group
+        self.cpu_group = cpu_group
 
 
 def _dtype_from_name(dtype_name: str) -> torch.dtype:
@@ -129,6 +137,25 @@ class TestDCPCommBackendConfig:
         )
         assert config.dcp_comm_backend == "a2a"
 
+    def test_a2a_symm_requires_dcp_greater_than_1(self):
+        """A2A-symm backend requires decode_context_parallel_size > 1."""
+        with pytest.raises(
+            ValueError, match="requires decode_context_parallel_size > 1"
+        ):
+            ParallelConfig(
+                dcp_comm_backend="a2a_symm",
+                decode_context_parallel_size=1,
+            )
+
+    def test_a2a_symm_with_dcp_valid(self):
+        """A2A-symm backend is valid when DCP > 1."""
+        config = ParallelConfig(
+            dcp_comm_backend="a2a_symm",
+            tensor_parallel_size=4,
+            decode_context_parallel_size=4,
+        )
+        assert config.dcp_comm_backend == "a2a_symm"
+
     def test_invalid_backend_rejected(self):
         """Invalid backend values are rejected."""
         with pytest.raises(ValueError, match="must be one of|Input should be"):
@@ -143,6 +170,21 @@ class TestDCPCommBackendConfig:
             decode_context_parallel_size=1,
         )
         assert config.dcp_comm_backend == "ag_rs"
+
+
+class TestDCPCombineResolution:
+    """The backend string must select the matching combine implementation."""
+
+    def test_backend_selects_combine(self):
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            dcp_a2a_combine_fn,
+            dcp_a2a_lse_reduce,
+        )
+        from vllm.v1.attention.ops.dcp_symm_a2a import dcp_symm_a2a_lse_reduce
+
+        assert dcp_a2a_combine_fn("ag_rs") is None
+        assert dcp_a2a_combine_fn("a2a") is dcp_a2a_lse_reduce
+        assert dcp_a2a_combine_fn("a2a_symm") is dcp_symm_a2a_lse_reduce
 
 
 class TestLSEWeightedCombine:
@@ -393,8 +435,9 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
 
         init_workspace_manager(torch.device(f"cuda:{local_rank}"))
     try:
-        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_combine_fn
 
+        combine = dcp_a2a_combine_fn(env.get("COMBINE_BACKEND", "a2a"))
         dtype = _dtype_from_name(env["TEST_DTYPE"])
         return_lse = env["RETURN_LSE"] == "1"
         is_lse_base_on_e = env["LSE_BASE_E"] == "1"
@@ -420,13 +463,23 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
             dtype=torch.float32,
             generator=generator,
         )
-        actual = dcp_a2a_lse_reduce(
-            cp_attn_out,
-            cp_attn_lse,
-            _FakeCPGroup(world_size, dist.group.WORLD),
-            return_lse=return_lse,
-            is_lse_base_on_e=is_lse_base_on_e,
+        cp_group = _FakeCPGroup(
+            world_size,
+            dist.group.WORLD,
+            rank_in_group=rank,
+            cpu_group=dist.new_group(backend="gloo"),
         )
+        # Call twice: the symmetric-memory path alternates buffer slots, so a
+        # single call would not exercise slot reuse or the barrier that guards
+        # it. Both calls must produce the same answer.
+        for _ in range(2):
+            actual = combine(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                return_lse=return_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
 
         gathered_out = [torch.empty_like(cp_attn_out) for _ in range(world_size)]
         gathered_lse = [torch.empty_like(cp_attn_lse) for _ in range(world_size)]
@@ -478,6 +531,65 @@ def test_distributed_packed_a2a_matches_reference(dtype_name: str):
             "TEST_DTYPE": dtype_name,
             "RETURN_LSE": "1",
             "LSE_BASE_E": "1",
+        },
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
+)
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
+)
+@pytest.mark.parametrize("dtype_name", ["float16", "bfloat16", "float32"])
+def test_distributed_symm_a2a_matches_reference(dtype_name: str):
+    """The symmetric-memory path must match the same LSE-combine reference.
+
+    On hosts without peer symmetric memory this still runs: the op falls back
+    to the NCCL all-to-all, and the reference check covers that too.
+    """
+    _distributed_run(
+        _distributed_packed_a2a_worker,
+        world_size=4,
+        extra_env={
+            "TEST_DTYPE": dtype_name,
+            "RETURN_LSE": "1",
+            "LSE_BASE_E": "1",
+            "COMBINE_BACKEND": "a2a_symm",
+        },
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
+)
+def test_distributed_symm_a2a_base2_matches_reference():
+    _distributed_run(
+        _distributed_packed_a2a_worker,
+        world_size=4,
+        extra_env={
+            "TEST_DTYPE": "bfloat16",
+            "RETURN_LSE": "0",
+            "LSE_BASE_E": "0",
+            "COMBINE_BACKEND": "a2a_symm",
+        },
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
+)
+def test_distributed_symm_a2a_falls_back_when_budget_too_small():
+    """A batch larger than the symmetric buffers must still be correct."""
+    _distributed_run(
+        _distributed_packed_a2a_worker,
+        world_size=4,
+        extra_env={
+            "TEST_DTYPE": "bfloat16",
+            "RETURN_LSE": "1",
+            "LSE_BASE_E": "1",
+            "COMBINE_BACKEND": "a2a_symm",
+            "VLLM_DCP_SYMM_A2A_MAX_MB": "0",
         },
     )
 

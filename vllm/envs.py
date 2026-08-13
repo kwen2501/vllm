@@ -268,6 +268,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
+    VLLM_DCP_SYMM_A2A_MAX_MB: int = 128
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
@@ -1894,6 +1895,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable NCCL symmetric memory allocation and registration
     "VLLM_USE_NCCL_SYMM_MEM": lambda: bool(
         int(os.getenv("VLLM_USE_NCCL_SYMM_MEM", "0"))
+    ),
+    # Symmetric memory budget, in MiB, for one DCP `a2a_symm` layer geometry.
+    # Batches too large for it fall back to the NCCL all-to-all.
+    "VLLM_DCP_SYMM_A2A_MAX_MB": lambda: int(
+        os.getenv("VLLM_DCP_SYMM_A2A_MAX_MB", "128")
     ),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -72,7 +73,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_combine_fn
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -232,12 +233,10 @@ class BatchDCPPrefillWrapper:
     def __init__(
         self,
         workspace_buffer: torch.Tensor | None = None,
-        dcp_a2a: bool = False,
+        dcp_a2a: Callable | None = None,
     ):
-        if dcp_a2a:
-            self._dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
-        else:
-            self._dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+        combine = dcp_a2a or cp_lse_ag_out_rs
+        self._dcp_combine = partial(combine, is_lse_base_on_e=False)
         self._context = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, get_kv_cache_layout()
         )
@@ -693,7 +692,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.dcp_kv_cache_interleave_size = 1
         self.use_dcp = self.dcp_world_size > 1
         self.dcp_a2a = (
-            self.use_dcp and vllm_config.parallel_config.dcp_comm_backend == "a2a"
+            dcp_a2a_combine_fn(vllm_config.parallel_config.dcp_comm_backend)
+            if self.use_dcp
+            else None
         )
 
         # Compatible with models with non-uniform per-layer head counts.
@@ -1616,14 +1617,12 @@ class FlashInferImpl(AttentionImpl):
             self._nvfp4_fp8_out = None
 
         dcp_a2a = (
-            vllm_config is not None
+            dcp_a2a_combine_fn(vllm_config.parallel_config.dcp_comm_backend)
+            if vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
-            and vllm_config.parallel_config.dcp_comm_backend == "a2a"
+            else None
         )
-        if dcp_a2a:
-            self.dcp_combine = partial(dcp_a2a_lse_reduce, is_lse_base_on_e=False)
-        else:
-            self.dcp_combine = partial(cp_lse_ag_out_rs, is_lse_base_on_e=False)
+        self.dcp_combine = partial(dcp_a2a or cp_lse_ag_out_rs, is_lse_base_on_e=False)
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         # XQA does not support FP8/NVFP4 output, so require trtllm-gen
