@@ -7,8 +7,10 @@ Integration tests for NCCL and IPC weight transfer between processes using Ray.
 """
 
 import pickle
+import sys
 import threading
 import time
+import types
 from unittest.mock import MagicMock
 
 import pybase64 as base64
@@ -41,6 +43,20 @@ from vllm.distributed.weight_transfer.ipc_engine import (
     IPCWeightTransferEngine,
     IPCWeightTransferInitInfo,
     IPCWeightTransferUpdateInfo,
+)
+from vllm.distributed.weight_transfer.m2n_common import (
+    REPLICATE,
+    REPLICATED,
+    M2NMesh,
+    check_placements,
+    check_transferable,
+    resolve_layout,
+    validate_layout,
+)
+from vllm.distributed.weight_transfer.m2n_engine import (
+    M2NWeightTransferEngine,
+    M2NWeightTransferInitInfo,
+    M2NWeightTransferUpdateInfo,
 )
 from vllm.distributed.weight_transfer.nccl_engine import (
     NCCLTrainerInitInfo,
@@ -309,6 +325,9 @@ class TestEngineRegistry:
             WeightTransferEngineFactory.register_engine(
                 "nccl", NCCLWeightTransferEngine
             )
+
+    def test_worker_registry_exposes_nccl_m2n(self):
+        assert "nccl_m2n" in WeightTransferEngineFactory._registry
 
 
 # --- Unit Tests: Sparse patch application (CPU) ---
@@ -1928,3 +1947,465 @@ def test_sparse_nccl_trainer_non_sender_skips_client():
     assert isinstance(engine, SparseNCCLTrainerWeightTransferEngine)
     engine.send_weights([_sparse_patch()])
     assert client.order == []
+
+
+# --- NCCL M2N backend ---
+#
+# The real `nccl.m2n` runtime (nccl-extensions) is out of tree and not
+# installed in CI. Tests that reach `init_transfer_engine` install a dumb
+# stand-in that records handles and reshard calls and validates nothing, so
+# it can never compensate for a missing vLLM-side check.
+
+
+class _FakeM2NHandle:
+    def __init__(self):
+        self.destroyed = False
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def _make_fake_m2n():
+    m2n = types.ModuleType("nccl.m2n")
+    m2n.handles = []
+    m2n.reshard_calls = []
+
+    class Mesh:
+        def __init__(self, dims, start_rank=0):
+            self.dims = tuple(dims)
+            self.start_rank = start_rank
+
+    class Shard:
+        def __init__(self, dim):
+            self.dim = dim
+
+    class Replicate:
+        pass
+
+    class Config:
+        def __init__(self, max_cta=None):
+            self.max_cta = max_cta
+
+    class Handle:
+        @staticmethod
+        def create(config):
+            handle = _FakeM2NHandle()
+            m2n.handles.append(handle)
+            return handle
+
+    def reshard(*args, **kwargs):
+        m2n.reshard_calls.append((args, kwargs))
+
+    m2n.Mesh = Mesh
+    m2n.Shard = Shard
+    m2n.Replicate = Replicate
+    m2n.Config = Config
+    m2n.Handle = Handle
+    m2n.reshard = reshard
+    return m2n
+
+
+def _install_fake_m2n(monkeypatch):
+    m2n = _make_fake_m2n()
+    nccl_pkg = types.ModuleType("nccl")
+    nccl_pkg.m2n = m2n
+    monkeypatch.setitem(sys.modules, "nccl", nccl_pkg)
+    monkeypatch.setitem(sys.modules, "nccl.m2n", m2n)
+    return m2n
+
+
+def _make_m2n_engine(model=None):
+    vllm_config = create_mock_vllm_config()
+    vllm_config.parallel_config.data_parallel_size = 1
+    return M2NWeightTransferEngine(
+        WeightTransferConfig(backend="nccl_m2n"),
+        vllm_config,
+        torch.device("cuda"),
+        model if model is not None else MagicMock(spec=torch.nn.Module),
+    )
+
+
+def _m2n_init_info(**overrides):
+    """A plan consistent with `_make_m2n_engine`'s single-worker deployment."""
+    fields = dict(
+        master_address="127.0.0.1",
+        master_port=29500,
+        rank_offset=1,
+        world_size=2,
+        src_mesh_dims=[1, 1],
+        dst_mesh_dims=[1, 1],
+        names=["w"],
+        dtype_names=["float32"],
+        shapes=[[4, 4]],
+        src_placements=[None],
+    )
+    fields.update(overrides)
+    return M2NWeightTransferInitInfo(**fields)
+
+
+class TestM2NLayout:
+    def test_replicated_splits_nothing(self):
+        """A replicated tensor imposes no divisibility constraint. The shape
+        dims are deliberately coprime with the mesh size: a layout that actually
+        split the tensor would reject them."""
+        mesh = M2NMesh((2, 2), start_rank=1)
+        indivisible_shape = (7, 13)  # neither dim divisible by any mesh axis
+
+        resolved_mesh, placements = resolve_layout(mesh, REPLICATED)
+        validate_layout(resolved_mesh, placements, indivisible_shape, "destination")
+
+    def test_replicated_keeps_the_same_ranks(self):
+        """Replication re-factors the mesh to get a size-1 axis for its no-op
+        shard. That is only sound if it still covers exactly the same GPUs."""
+        mesh = M2NMesh((2, 3), start_rank=4)
+        resolved_mesh, _ = resolve_layout(mesh, REPLICATED)
+        assert resolved_mesh.size == mesh.size
+        assert resolved_mesh.start_rank == mesh.start_rank
+
+    def test_sharded_keeps_its_own_factorization(self):
+        """Rank order decides who owns which shard, so a sharded tensor must
+        not be re-factored the way a replicated one is."""
+        mesh = M2NMesh((2, 3), start_rank=4)
+        resolved_mesh, placements = resolve_layout(mesh, (REPLICATE, 0))
+        assert resolved_mesh == mesh
+        assert placements == (REPLICATE, 0)
+
+    def test_two_shard_axes_rejected(self):
+        """One axis has to replicate; a 2-D mesh that shards both is not
+        something a single reshard can express."""
+        with pytest.raises(ValueError, match="shards both"):
+            check_placements((0, 1))
+
+    def test_negative_placement_code_rejected(self):
+        """Only REPLICATE (-1) may be negative. Fails if a code like -2 again
+        passes validation — Python negative indexing made validate_layout
+        check the wrong tensor dim — and flows into m2n.Shard(-2) instead of
+        failing the init RPC."""
+        with pytest.raises(ValueError, match="non-negative tensor dim"):
+            check_placements((-2, REPLICATE))
+
+    def test_shard_dim_must_exist(self):
+        with pytest.raises(ValueError, match="rank 2"):
+            validate_layout(M2NMesh((1, 2), 0), (REPLICATE, 2), (8, 16), "source")
+
+    def test_shard_must_divide_evenly(self):
+        with pytest.raises(ValueError, match="does not divide evenly"):
+            validate_layout(M2NMesh((1, 3), 0), (REPLICATE, 0), (8, 16), "source")
+
+
+class TestM2NTransferable:
+    def test_unsupported_dtype_names_the_parameter(self):
+        with pytest.raises(ValueError, match="'w'"):
+            check_transferable("w", torch.complex64, (4,))
+
+    def test_rank_four_rejected(self):
+        with pytest.raises(ValueError, match="rank 4"):
+            check_transferable("w", torch.bfloat16, (2, 2, 2, 2))
+
+
+class TestM2NWireTypes:
+    def _init_info(self, **overrides):
+        fields = dict(
+            master_address="127.0.0.1",
+            master_port=1234,
+            rank_offset=1,
+            world_size=3,
+            src_mesh_dims=[1, 1],
+            dst_mesh_dims=[2, 1],
+            names=["w"],
+            dtype_names=["bfloat16"],
+            shapes=[[16, 16]],
+            src_placements=[None],
+        )
+        fields.update(overrides)
+        return M2NWeightTransferInitInfo(**fields)
+
+    def test_accepts_a_consistent_plan(self):
+        assert self._init_info().names == ["w"]
+
+    def test_ragged_plan_rejected(self):
+        with pytest.raises(ValueError, match="`shapes`"):
+            self._init_info(shapes=[])
+
+    def test_destination_mesh_must_cover_the_workers(self):
+        """The trainer declares the inference mesh, so one that does not cover
+        the workers is a config error — and it has to fail the init RPC, since
+        a mismatched mesh would otherwise surface as a hung collective."""
+        with pytest.raises(ValueError, match="dst_mesh_dims"):
+            self._init_info(dst_mesh_dims=[3, 1])  # 3 != the 2 workers
+
+    def test_world_must_hold_a_trainer_and_a_worker(self):
+        with pytest.raises(ValueError, match="rank_offset"):
+            self._init_info(rank_offset=3, world_size=3)
+
+
+def test_m2n_unknown_dtype_name_fails_init_with_value_error(monkeypatch):
+    """An unknown dtype name must fail the init RPC with a ValueError naming
+    the parameter; fails if it again leaks AttributeError from
+    getattr(torch, name) with no pointer to the offending parameter."""
+    _install_fake_m2n(monkeypatch)
+    engine = _make_m2n_engine()
+
+    with pytest.raises(ValueError, match="'w' has unknown dtype name 'bfloat61'"):
+        engine.init_transfer_engine(_m2n_init_info(dtype_names=["bfloat61"]))
+
+
+def test_m2n_worker_count_mismatch_fails_before_rendezvous(monkeypatch):
+    """A declared worker count that disagrees with the deployment must fail
+    the init RPC; fails if it again reaches the rendezvous, which waits
+    forever for ranks that never join."""
+    import vllm.distributed.weight_transfer.m2n_engine as m2n_engine_mod
+
+    _install_fake_m2n(monkeypatch)
+    rendezvous = MagicMock()
+    monkeypatch.setattr(m2n_engine_mod, "worker_init_process_group", rendezvous)
+    engine = _make_m2n_engine()  # this deployment has exactly 1 worker
+
+    with pytest.raises(ValueError, match="wait forever"):
+        engine.init_transfer_engine(_m2n_init_info(world_size=3, dst_mesh_dims=[2, 1]))
+    rendezvous.assert_not_called()
+
+
+def test_m2n_reinit_releases_previous_handle_and_communicator(monkeypatch):
+    """Re-init (a trainer restart) must destroy the previous m2n handle — it
+    holds the staging pool — and NCCL communicator; fails if either again
+    leaks when init_transfer_engine overwrites them."""
+    if torch.accelerator.device_count() < 1:
+        pytest.skip("Need at least 1 GPU for this test")
+
+    import vllm.distributed.weight_transfer.m2n_engine as m2n_engine_mod
+
+    m2n = _install_fake_m2n(monkeypatch)
+    comms = [MagicMock(), MagicMock()]
+    monkeypatch.setattr(
+        m2n_engine_mod, "worker_init_process_group", lambda info, pc: comms.pop(0)
+    )
+    engine = _make_m2n_engine()
+
+    engine.init_transfer_engine(_m2n_init_info())
+    first_comm = engine.model_update_group
+    engine.init_transfer_engine(_m2n_init_info())
+
+    assert [handle.destroyed for handle in m2n.handles] == [True, False]
+    first_comm.destroy.assert_called_once()
+    engine.model_update_group.destroy.assert_not_called()
+
+
+def test_m2n_undeclared_name_fails_round_before_any_reshard(monkeypatch):
+    """A round naming an undeclared parameter must fail atomically; fails if
+    the check again runs inside the loop, where earlier parameters are
+    already resharded and loaded while the trainer stays blocked mid-round."""
+    if torch.accelerator.device_count() < 1:
+        pytest.skip("Need at least 1 GPU for this test")
+
+    import vllm.distributed.weight_transfer.m2n_engine as m2n_engine_mod
+
+    m2n = _install_fake_m2n(monkeypatch)
+    comm = MagicMock()
+    comm.comm = 1234  # comm_ptr resolves the raw handle before the name check
+    monkeypatch.setattr(
+        m2n_engine_mod, "worker_init_process_group", lambda info, pc: comm
+    )
+
+    loaded = []
+
+    class Recorder(torch.nn.Module):
+        def load_weights(self, weights):
+            loaded.extend(name for name, _ in weights)
+
+    engine = _make_m2n_engine(model=Recorder())
+    engine.init_transfer_engine(_m2n_init_info())
+
+    with pytest.raises(ValueError, match="not declared at init"):
+        engine.receive_weights(M2NWeightTransferUpdateInfo(names=["w", "undeclared"]))
+    assert m2n.reshard_calls == []
+    assert loaded == []
+
+
+# --- Integration Test: M2N Weight Transfer Between Ray Tasks ---
+
+
+def _m2n_param_tensor(shape, offset, device):
+    """Distinct deterministic contents per parameter, so a swapped or
+    reordered delivery cannot bitwise-match."""
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    return (torch.arange(numel, dtype=torch.float32, device=device) + offset).reshape(
+        shape
+    )
+
+
+@ray.remote(num_gpus=1)
+def m2n_trainer_broadcast_weights(
+    master_address: str,
+    master_port: int,
+    params: list[tuple[str, list[int], float]],
+) -> bool:
+    """Trainer task: joins the shared communicator as rank 0 and plays the
+    trainer half of the faked reshard — one broadcast per parameter, in
+    declared order."""
+    import torch
+
+    device = _set_ray_assigned_device()
+
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.utils import StatelessProcessGroup
+
+    pg = StatelessProcessGroup.create(
+        host=master_address, port=master_port, rank=0, world_size=2
+    )
+    comm = PyNcclCommunicator(pg, device=device.index)
+
+    stream = torch.cuda.current_stream()
+    for _, shape, offset in params:
+        comm.broadcast(_m2n_param_tensor(shape, offset, device), src=0, stream=stream)
+    torch.accelerator.synchronize()
+    return True
+
+
+@ray.remote(num_gpus=1)
+def m2n_worker_receive_weights(
+    master_address: str,
+    master_port: int,
+    params: list[tuple[str, list[int], float]],
+) -> dict:
+    """Worker task: runs the real M2NWeightTransferEngine end to end, with
+    only the out-of-tree reshard kernel replaced by a real NCCL broadcast on
+    the engine's own live communicator."""
+    import sys
+    from unittest.mock import MagicMock
+
+    import torch
+
+    device = _set_ray_assigned_device()
+
+    from vllm.config.parallel import ParallelConfig
+    from vllm.config.weight_transfer import WeightTransferConfig
+    from vllm.distributed.weight_transfer.m2n_engine import (
+        M2NWeightTransferEngine,
+        M2NWeightTransferInitInfo,
+        M2NWeightTransferUpdateInfo,
+    )
+
+    live = {}  # filled after init; the fake reshard broadcasts on this comm
+    m2n = _make_fake_m2n()
+
+    def reshard(send, buffer, comm, stream, **kwargs):
+        m2n.reshard_calls.append(buffer.shape)
+        live["comm"].broadcast(buffer, src=0, stream=stream)
+
+    m2n.reshard = reshard
+    nccl_pkg = types.ModuleType("nccl")
+    nccl_pkg.m2n = m2n
+    sys.modules["nccl"] = nccl_pkg
+    sys.modules["nccl.m2n"] = m2n
+
+    class TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name, shape, _ in params:
+                self.register_parameter(
+                    name,
+                    torch.nn.Parameter(
+                        torch.zeros(shape, device=device), requires_grad=False
+                    ),
+                )
+
+        def load_weights(self, weights):
+            for name, tensor in weights:
+                self.get_parameter(name).data.copy_(tensor)
+
+    vllm_config = MagicMock()
+    parallel_config = MagicMock(spec=ParallelConfig)
+    parallel_config.rank = 0
+    parallel_config.world_size = 1
+    parallel_config.data_parallel_rank = 0
+    parallel_config.data_parallel_index = 0
+    parallel_config.data_parallel_size = 1
+    vllm_config.parallel_config = parallel_config
+    vllm_config.model_config = MagicMock()
+
+    model = TinyModel()
+    engine = M2NWeightTransferEngine(
+        WeightTransferConfig(backend="nccl_m2n"), vllm_config, device, model
+    )
+    engine.init_transfer_engine(
+        M2NWeightTransferInitInfo(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=1,
+            world_size=2,
+            src_mesh_dims=[1, 1],
+            dst_mesh_dims=[1, 1],
+            names=[name for name, _, _ in params],
+            dtype_names=["float32"] * len(params),
+            shapes=[shape for _, shape, _ in params],
+            src_placements=[None] * len(params),
+        )
+    )
+    live["comm"] = engine.model_update_group
+
+    engine.receive_weights(
+        M2NWeightTransferUpdateInfo(names=[name for name, _, _ in params])
+    )
+    torch.accelerator.synchronize()
+
+    params_match = all(
+        torch.equal(
+            model.get_parameter(name).data, _m2n_param_tensor(shape, offset, device)
+        )
+        for name, shape, offset in params
+    )
+    handle = m2n.handles[0]
+    comm = engine.model_update_group
+    engine.shutdown()
+    return {
+        "params_match": params_match,
+        "num_reshards": len(m2n.reshard_calls),
+        "handle_destroyed": handle.destroyed,
+        "comm_destroyed": comm.disabled,
+        "group_cleared": engine.model_update_group is None,
+    }
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2,
+    reason="Need at least 2 GPUs to run the M2N weight transfer test.",
+)
+def test_m2n_weight_transfer_between_processes():
+    """End-to-end worker-side nccl_m2n round over a live 2-GPU communicator.
+
+    Real StatelessProcessGroup rendezvous, real PyNcclCommunicator, real
+    engine init/receive/shutdown; only the out-of-tree `nccl.m2n` kernel is
+    replaced by a fake whose reshard delivers the trainer's bytes via a real
+    NCCL broadcast on the engine's own communicator. Covers the init
+    handshake wire types, rendezvous and rank assignment, `comm_ptr` on a
+    live communicator, per-parameter buffer dtype/shape wiring, bitwise
+    `load_weights` delivery in declared order, and `shutdown()` destroying
+    the live handle and communicator (the fix that made shutdown release
+    instead of just dropping the reference). The m2n reshard math itself is
+    NOT covered here; it is exercised out of tree.
+    """
+    _init_ray_for_weight_transfer()
+
+    master_address = "127.0.0.1"
+    master_port = get_open_port()
+    params = [("w", [4, 6], 1000.0), ("b", [3], 2000.0)]
+
+    inference_future = m2n_worker_receive_weights.remote(
+        master_address, master_port, params
+    )
+    trainer_future = m2n_trainer_broadcast_weights.remote(
+        master_address, master_port, params
+    )
+    trainer_result, result = ray.get([trainer_future, inference_future])
+
+    assert trainer_result, "Trainer should complete successfully"
+    assert result["params_match"], f"Bitwise mismatch after the round: {result}"
+    assert result["num_reshards"] == len(params)
+    assert result["handle_destroyed"], "shutdown() must destroy the m2n handle"
+    assert result["comm_destroyed"], (
+        "shutdown() must destroy the NCCL communicator, not just drop it"
+    )
+    assert result["group_cleared"]
