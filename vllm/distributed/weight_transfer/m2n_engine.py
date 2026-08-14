@@ -175,6 +175,9 @@ class M2NWeightTransferEngine(
         a bad plan fails the init RPC instead of hanging the first collective.
         """
         self._m2n = import_m2n()
+        # Re-init (e.g. a trainer restart) must not leak the previous handle —
+        # it holds the staging pool — or the previous communicator.
+        self._release()
         self._metas = []
 
         self._src_mesh = M2NMesh(tuple(init_info.src_mesh_dims), 0)
@@ -182,6 +185,18 @@ class M2NWeightTransferEngine(
             raise ValueError(
                 f"source mesh covers {self._src_mesh.size} ranks, but there are "
                 f"{init_info.rank_offset} trainer ranks"
+            )
+        num_workers = init_info.world_size - init_info.rank_offset
+        local_workers = (
+            self.parallel_config.data_parallel_size * self.parallel_config.world_size
+        )
+        if num_workers != local_workers:
+            raise ValueError(
+                f"init info declares {num_workers} inference workers "
+                f"(world_size {init_info.world_size} - rank_offset "
+                f"{init_info.rank_offset}), but this deployment has "
+                f"{local_workers}; the rendezvous would wait forever for "
+                "ranks that never join"
             )
         # The inference topology, as declared by the trainer. This is the mesh
         # a sharded destination is placed over; a replicated one is described
@@ -195,7 +210,11 @@ class M2NWeightTransferEngine(
             init_info.shapes,
             init_info.src_placements,
         ):
-            dtype = getattr(torch, name_dtype)
+            dtype = getattr(torch, name_dtype, None)
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(
+                    f"parameter '{name}' has unknown dtype name {name_dtype!r}"
+                )
             check_transferable(name, dtype, shape)
             codes = REPLICATED if placements is None else tuple(placements)
             src_mesh, src_placements = resolve_layout(self._src_mesh, codes)
@@ -245,17 +264,21 @@ class M2NWeightTransferEngine(
             disable_mtp_completeness_check,
         )
 
+        # Checked before any reshard is issued: failing mid-round would leave
+        # earlier parameters already loaded and the trainer blocked in the
+        # reshard this side never entered.
+        undeclared = [n for n in update_info.names if n not in self._index]
+        if undeclared:
+            raise ValueError(
+                f"parameters {undeclared[:8]} were not declared at init; the "
+                "trainer must send the same parameter set it announced"
+            )
+
         comm = comm_ptr(self.model_update_group)
         stream = torch.cuda.current_stream()
         with disable_mtp_completeness_check():
             for name in update_info.names:
-                index = self._index.get(name)
-                if index is None:
-                    raise ValueError(
-                        f"parameter '{name}' was not declared at init; the "
-                        "trainer must send the same parameter set it announced"
-                    )
-                meta = self._metas[index]
+                meta = self._metas[self._index[name]]
                 buffer = torch.empty(meta.shape, dtype=meta.dtype, device=self.device)
                 self._reshard(comm, stream, meta, buffer)
                 # `load_weights` reads on the host stream, so the transfer has
@@ -287,9 +310,14 @@ class M2NWeightTransferEngine(
         )
 
     def shutdown(self) -> None:
+        self._release()
+
+    def _release(self) -> None:
         if self._handle is not None:
             # M2N does not synchronize caller streams on finalize.
             torch.accelerator.synchronize()
             self._handle.destroy()
             self._handle = None
-        self.model_update_group = None
+        if self.model_update_group is not None:
+            self.model_update_group.destroy()
+            self.model_update_group = None

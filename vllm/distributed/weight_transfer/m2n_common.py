@@ -129,6 +129,11 @@ def check_placements(placements: Placements) -> None:
     """
     if len(placements) != MESH_NDIMS:
         raise ValueError(f"placements must have {MESH_NDIMS} entries")
+    if any(code != REPLICATE and code < 0 for code in placements):
+        raise ValueError(
+            f"placement codes must be {REPLICATE} (replicate) or a "
+            f"non-negative tensor dim, got {placements}"
+        )
     num_sharded = sum(code != REPLICATE for code in placements)
     if num_sharded == 0:
         raise ValueError(
